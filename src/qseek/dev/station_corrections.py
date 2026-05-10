@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections import defaultdict
@@ -844,6 +845,131 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
 
         return delays
 
+    def _compute_cache_key(self) -> str:
+        """Compute a hash key based on config parameters and import rundirs.
+
+        The cache is invalidated when any config parameter or the source
+        data (detected by rundir modification times and file sizes) changes.
+        """
+        key_parts = [
+            str(sorted(str(p) for p in self.import_rundirs)),
+            self.weighting,
+            str(self.min_confidence),
+            str(self.min_distance_border),
+            str(self.min_num_picks),
+            str(self.spatial_weighting_exponent),
+            str(self.resolution_octree_level),
+            self.delay_interpolation_method,
+        ]
+
+        # Include file modification times from import rundirs for invalidation
+        for rd in sorted(self.import_rundirs, key=str):
+            rd_path = Path(rd).resolve()
+            detections_file = rd_path / "detections.json"
+            receivers_file = rd_path / "detections_receivers.json"
+            for f in (detections_file, receivers_file):
+                if f.exists():
+                    stat = f.stat()
+                    key_parts.append(f"{f}:{stat.st_mtime}:{stat.st_size}")
+
+        key_str = "|".join(key_parts)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+    def _load_from_cache(
+        self,
+        corrections_dir: Path,
+        phases: list[str],
+        station_nsls: list[str],
+    ) -> bool:
+        """Try to load SSST grid delays from cached .npy files.
+
+        Returns True if cache was loaded successfully, False otherwise.
+        """
+        cache_file = corrections_dir / "cache_key.txt"
+        if not cache_file.exists():
+            return False
+
+        # Check cache key matches
+        cached_key = cache_file.read_text().strip()
+        current_key = self._compute_cache_key()
+        if cached_key != current_key:
+            logger.info(
+                "SSST cache key mismatch (cached=%s, current=%s), recomputing",
+                cached_key, current_key,
+            )
+            return False
+
+        # Load grid coordinates
+        coords_file = corrections_dir / "grid_coords.npy"
+        if not coords_file.exists():
+            return False
+        self._grid_coords = np.load(coords_file)
+
+        # Load grid delays from .npy files
+        self._grid_delays = {}
+        for phase in phases:
+            phase_dir = corrections_dir / phase.replace(":", "_")
+            if not phase_dir.is_dir():
+                continue
+            self._grid_delays[phase] = {}
+            for nsl_str in station_nsls:
+                npy_file = phase_dir / f"{nsl_str.replace('.', '_')}.npy"
+                if npy_file.exists():
+                    self._grid_delays[phase][nsl_str] = np.load(npy_file)
+                else:
+                    self._grid_delays[phase][nsl_str] = np.zeros(
+                        self._grid_coords.shape[0], dtype=np.float32
+                    )
+
+        if not self._grid_delays:
+            return False
+
+        logger.info(
+            "loaded SSST corrections from cache (%d phases, %d grid nodes)",
+            len(self._grid_delays),
+            self._grid_coords.shape[0],
+        )
+        return True
+
+    def _save_to_cache(
+        self,
+        corrections_dir: Path,
+        phases: list[str],
+        station_nsls: list[str],
+    ) -> None:
+        """Save SSST grid delays to cache files."""
+        corrections_dir.mkdir(exist_ok=True)
+
+        # Save cache key
+        cache_key = self._compute_cache_key()
+        (corrections_dir / "cache_key.txt").write_text(cache_key)
+
+        # Save grid coordinates
+        np.save(corrections_dir / "grid_coords.npy", self._grid_coords)
+
+        # Save metadata
+        meta = {
+            "cache_key": cache_key,
+            "n_grid_nodes": len(self._grid_nodes),
+            "octree_level": self.resolution_octree_level,
+            "phases": phases,
+            "stations": station_nsls,
+            "device": str(DEVICE),
+        }
+        (corrections_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+
+        # Save grid delays as numpy arrays
+        for phase, nsl_delays in self._grid_delays.items():
+            phase_dir = corrections_dir / phase.replace(":", "_")
+            phase_dir.mkdir(exist_ok=True)
+            for nsl_str, delays in nsl_delays.items():
+                np.save(
+                    phase_dir / f"{nsl_str.replace('.', '_')}.npy",
+                    delays,
+                )
+
+        logger.info("saved SSST cache (key=%s) to %s", cache_key, corrections_dir)
+
     async def prepare(
         self,
         stations: StationInventory,
@@ -854,6 +980,35 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         logger.info("preparing SourceSpecificStationCorrections (SSST)")
         phases_list = list(phases)
         station_nsls = [sta.nsl.pretty for sta in stations]
+
+        corrections_dir = rundir / "ssst_corrections"
+
+        # === Try loading from cache first ===
+        if corrections_dir.exists():
+            cache_loaded = self._load_from_cache(
+                corrections_dir, phases_list, station_nsls,
+            )
+            if cache_loaded:
+                # Build octree grid nodes for coordinate reference
+                ssst_octree = octree.model_copy(deep=True)
+                ssst_octree.model_post_init(None)
+                ssst_octree.set_level(self.resolution_octree_level)
+                self._grid_nodes = list(ssst_octree)
+
+                # Build interpolators from cached data
+                self._interpolators = await asyncio.to_thread(
+                    self._build_interpolators,
+                    self._grid_coords,
+                    self._grid_delays,
+                )
+                logger.info(
+                    "SSST corrections loaded from cache — "
+                    "skipped GPU computation"
+                )
+                return
+
+        # === No valid cache, compute from scratch ===
+        logger.info("no valid SSST cache found, computing from scratch")
 
         # Collect delay records
         all_records: list[DelayRecord] = []
@@ -907,31 +1062,8 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
             self._grid_delays,
         )
 
-        # Save corrections
-        corrections_dir = rundir / "ssst_corrections"
-        corrections_dir.mkdir(exist_ok=True)
-
-        # Save grid metadata
-        meta = {
-            "n_grid_nodes": len(self._grid_nodes),
-            "octree_level": self.resolution_octree_level,
-            "phases": phases_list,
-            "stations": station_nsls,
-            "device": str(DEVICE),
-        }
-        (corrections_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
-
-        # Save grid delays as numpy arrays
-        for phase, nsl_delays in self._grid_delays.items():
-            phase_dir = corrections_dir / phase.replace(":", "_")
-            phase_dir.mkdir(exist_ok=True)
-            for nsl_str, delays in nsl_delays.items():
-                np.save(
-                    phase_dir / f"{nsl_str.replace('.', '_')}.npy",
-                    delays,
-                )
-
-        logger.info("saved SSST corrections to %s", corrections_dir)
+        # Save to cache
+        self._save_to_cache(corrections_dir, phases_list, station_nsls)
 
         # Plot SSST 3D volume
         await asyncio.to_thread(
