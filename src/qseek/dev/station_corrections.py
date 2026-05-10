@@ -289,10 +289,11 @@ def _plot_ssst_3d_volume(
     grid_delays: dict[str, dict[str, np.ndarray]],
     output_dir: Path,
 ) -> None:
-    """Plot SSST delay grid as 3D volume visualisation.
+    """Plot SSST delay grid as 3D volume with smooth surface faces.
 
-    Creates 3D scatter plots showing spatial distribution of delays
-    with blue-red diverging colormap, similar to a volume rendering.
+    Renders the 3 visible outer faces of the volume box as smooth colored
+    surfaces using plot_surface with facecolors, producing a result similar
+    to volume rendering.
     """
     try:
         import matplotlib
@@ -306,49 +307,92 @@ def _plot_ssst_3d_volume(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    east = grid_coords[:, 0]
-    north = grid_coords[:, 1]
-    depth = grid_coords[:, 2]
+    # Extract regular grid axes
+    east_ax = np.unique(grid_coords[:, 0])
+    north_ax = np.unique(grid_coords[:, 1])
+    depth_ax = np.unique(grid_coords[:, 2])
+    ne, nn, nd = len(east_ax), len(north_ax), len(depth_ax)
+
+    if ne < 2 or nn < 2 or nd < 2:
+        logger.warning("grid too small for volume plot")
+        return
+
+    # Build index lookup for flat → 3D
+    e_idx = np.searchsorted(east_ax, grid_coords[:, 0])
+    n_idx = np.searchsorted(north_ax, grid_coords[:, 1])
+    d_idx = np.searchsorted(depth_ax, grid_coords[:, 2])
 
     for phase, nsl_delays in grid_delays.items():
-        for nsl_str, delays in nsl_delays.items():
-            if np.all(delays == 0):
+        for nsl_str, delays_flat in nsl_delays.items():
+            if np.all(delays_flat == 0):
                 continue
+
+            # Reshape to 3D
+            vol = np.zeros((ne, nn, nd), dtype=np.float32)
+            vol[e_idx, n_idx, d_idx] = delays_flat
+
+            vmax = max(abs(np.nanmin(vol)), abs(np.nanmax(vol)))
+            if vmax < 1e-8:
+                continue
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+            cmap = plt.cm.RdBu_r
 
             fig = plt.figure(figsize=(14, 10))
             ax = fig.add_subplot(111, projection="3d")
 
-            # Use diverging colormap centered at 0
-            vmax = max(abs(np.nanmin(delays)), abs(np.nanmax(delays)))
-            if vmax < 1e-6:
-                continue
-            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+            # Plot 3 visible faces of the bounding box as smooth surfaces
+            # Use negative depth so surface (depth=0) is on top
+            neg_depth = -depth_ax
 
-            sc = ax.scatter(
-                east, north, -depth,  # negative depth so surface is up
-                c=delays,
-                cmap="RdBu_r",
-                norm=norm,
-                s=12,
-                alpha=0.6,
-                edgecolors="none",
+            # ── Face 1: Top (depth = min, i.e. surface) ──
+            E_top, N_top = np.meshgrid(east_ax, north_ax, indexing="ij")
+            Z_top = np.full_like(E_top, neg_depth[0])
+            colors_top = cmap(norm(vol[:, :, 0]))
+            ax.plot_surface(
+                E_top, N_top, Z_top, facecolors=colors_top,
+                shade=False, alpha=0.9, rstride=1, cstride=1,
             )
 
-            ax.set_xlabel("Easting (m)", fontsize=10)
-            ax.set_ylabel("Northing (m)", fontsize=10)
-            ax.set_zlabel("Depth (m)", fontsize=10)
+            # ── Face 2: Front (north = max) ──
+            E_front, D_front = np.meshgrid(east_ax, neg_depth, indexing="ij")
+            N_front = np.full_like(E_front, north_ax[-1])
+            colors_front = cmap(norm(vol[:, -1, :]))
+            ax.plot_surface(
+                E_front, N_front, D_front, facecolors=colors_front,
+                shade=False, alpha=0.9, rstride=1, cstride=1,
+            )
+
+            # ── Face 3: Right side (east = max) ──
+            N_side, D_side = np.meshgrid(north_ax, neg_depth, indexing="ij")
+            E_side = np.full_like(N_side, east_ax[-1])
+            colors_side = cmap(norm(vol[-1, :, :]))
+            ax.plot_surface(
+                E_side, N_side, D_side, facecolors=colors_side,
+                shade=False, alpha=0.9, rstride=1, cstride=1,
+            )
+
+            # Labels and styling
+            ax.set_xlabel("Easting (m)", fontsize=10, labelpad=10)
+            ax.set_ylabel("Northing (m)", fontsize=10, labelpad=10)
+            ax.set_zlabel("Depth (m)", fontsize=10, labelpad=10)
+            ax.tick_params(labelsize=8)
+            ax.view_init(elev=25, azim=-60)
+
+            # Colorbar
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            cbar = fig.colorbar(
+                sm, ax=ax, orientation="horizontal",
+                shrink=0.6, pad=0.08, aspect=30,
+            )
+            cbar.set_label("Delay (s)", fontsize=10)
 
             phase_short = phase.split(":")[-1] if ":" in phase else phase
             ax.set_title(
-                f"SSST Corrections — Phase: {phase_short}, Station: {nsl_str}",
-                fontsize=12, pad=20,
+                f"SSST Corrections — Phase: {phase_short}, "
+                f"Station: {nsl_str}",
+                fontsize=12, pad=15,
             )
-
-            cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1)
-            cbar.set_label("Delay (s)", fontsize=10)
-
-            ax.tick_params(labelsize=8)
-            ax.view_init(elev=25, azim=-60)
 
             safe_nsl = nsl_str.replace(".", "_")
             safe_phase = phase.replace(":", "_")
@@ -357,69 +401,90 @@ def _plot_ssst_3d_volume(
             plt.close(fig)
             logger.info("saved SSST 3D plot: %s", filename)
 
-        # Also create 2D slice plots (NE, ED, ND) for overview
-        _plot_ssst_slices(east, north, depth, nsl_delays, phase, output_dir)
+        # 2D slice plots
+        _plot_ssst_slices(
+            east_ax, north_ax, depth_ax, vol.shape,
+            nsl_delays, e_idx, n_idx, d_idx,
+            phase, output_dir,
+        )
 
 
 def _plot_ssst_slices(
-    east: np.ndarray,
-    north: np.ndarray,
-    depth: np.ndarray,
+    east_ax: np.ndarray,
+    north_ax: np.ndarray,
+    depth_ax: np.ndarray,
+    grid_shape: tuple[int, int, int],
     nsl_delays: dict[str, np.ndarray],
+    e_idx: np.ndarray,
+    n_idx: np.ndarray,
+    d_idx: np.ndarray,
     phase: str,
     output_dir: Path,
 ) -> None:
-    """Plot 2D slice views (top, front, side) of SSST grid."""
+    """Plot 2D slice views using smooth contourf instead of scatter."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
 
-    # Average delays across all stations for overview
-    all_delays = [d for d in nsl_delays.values() if not np.all(d == 0)]
-    if not all_delays:
-        return
-    avg_delays = np.mean(all_delays, axis=0)
+    ne, nn, nd = grid_shape
 
-    vmax = max(abs(np.nanmin(avg_delays)), abs(np.nanmax(avg_delays)))
-    if vmax < 1e-6:
+    # Average delays across all stations for overview
+    all_vols = []
+    for delays_flat in nsl_delays.values():
+        if np.all(delays_flat == 0):
+            continue
+        vol = np.zeros((ne, nn, nd), dtype=np.float32)
+        vol[e_idx, n_idx, d_idx] = delays_flat
+        all_vols.append(vol)
+
+    if not all_vols:
+        return
+    avg_vol = np.mean(all_vols, axis=0)
+
+    vmax = max(abs(np.nanmin(avg_vol)), abs(np.nanmax(avg_vol)))
+    if vmax < 1e-8:
         return
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
     phase_short = phase.split(":")[-1] if ":" in phase else phase
     safe_phase = phase.replace(":", "_")
 
+    # Top view: average over depth
     slices = [
-        ("NE", east, north, "Easting (m)", "Northing (m)", "top_view"),
-        ("ED", east, depth, "Easting (m)", "Depth (m)", "front_view"),
-        ("ND", north, depth, "Northing (m)", "Depth (m)", "side_view"),
+        ("top_view", "NE",
+         east_ax, north_ax,
+         avg_vol.mean(axis=2).T,  # (nn, ne)
+         "Easting (m)", "Northing (m)"),
+        ("front_view", "ED",
+         east_ax, -depth_ax,
+         avg_vol.mean(axis=1).T,  # (nd, ne)
+         "Easting (m)", "-Depth (m)"),
+        ("side_view", "ND",
+         north_ax, -depth_ax,
+         avg_vol.mean(axis=0).T,  # (nd, nn)
+         "Northing (m)", "-Depth (m)"),
     ]
 
-    for name, x, y, xlabel, ylabel, suffix in slices:
+    for suffix, name, x_ax, y_ax, data_2d, xlabel, ylabel in slices:
         fig, ax = plt.subplots(figsize=(10, 8))
 
-        # Group by unique (x, y) and take max along the third axis
-        sc = ax.scatter(
-            x, -y if "Depth" in ylabel else y,
-            c=avg_delays,
+        cf = ax.contourf(
+            x_ax, y_ax, data_2d,
+            levels=50,
             cmap="RdBu_r",
             norm=norm,
-            s=20,
-            alpha=0.7,
-            edgecolors="none",
         )
 
         ax.set_xlabel(xlabel, fontsize=11)
-        ax.set_ylabel(
-            f"-{ylabel}" if "Depth" in ylabel else ylabel, fontsize=11,
-        )
+        ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(
             f"SSST Average Delay — {name} view, Phase: {phase_short}",
             fontsize=12,
         )
 
-        cbar = fig.colorbar(sc, ax=ax)
+        cbar = fig.colorbar(cf, ax=ax)
         cbar.set_label("Delay (s)", fontsize=10)
         ax.set_aspect("equal")
         ax.tick_params(labelsize=9)
