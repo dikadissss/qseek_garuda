@@ -289,22 +289,11 @@ def _plot_ssst_3d_volume(
     grid_delays: dict[str, dict[str, np.ndarray]],
     output_dir: Path,
 ) -> None:
-    """Plot SSST delay grid as 3D volume with smooth surface faces.
+    """Plot SSST delay volume for selected stations.
 
-    Renders the 3 visible outer faces of the volume box as smooth colored
-    surfaces using plot_surface with facecolors, producing a result similar
-    to volume rendering.
+    Uses plotly for interactive 3D volume rendering if available,
+    otherwise falls back to matplotlib multi-slice approach.
     """
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import TwoSlopeNorm
-    except ImportError:
-        logger.warning("matplotlib not available, skipping SSST plots")
-        return
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract regular grid axes
@@ -317,7 +306,7 @@ def _plot_ssst_3d_volume(
         logger.warning("grid too small for volume plot")
         return
 
-    # Build index lookup for flat → 3D
+    # Build index lookup
     e_idx = np.searchsorted(east_ax, grid_coords[:, 0])
     n_idx = np.searchsorted(north_ax, grid_coords[:, 1])
     d_idx = np.searchsorted(depth_ax, grid_coords[:, 2])
@@ -327,86 +316,181 @@ def _plot_ssst_3d_volume(
             if np.all(delays_flat == 0):
                 continue
 
-            # Reshape to 3D
             vol = np.zeros((ne, nn, nd), dtype=np.float32)
             vol[e_idx, n_idx, d_idx] = delays_flat
 
             vmax = max(abs(np.nanmin(vol)), abs(np.nanmax(vol)))
             if vmax < 1e-8:
                 continue
-            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-            cmap = plt.cm.RdBu_r
-
-            fig = plt.figure(figsize=(14, 10))
-            ax = fig.add_subplot(111, projection="3d")
-
-            # Plot 3 visible faces of the bounding box as smooth surfaces
-            # Use negative depth so surface (depth=0) is on top
-            neg_depth = -depth_ax
-
-            # ── Face 1: Top (depth = min, i.e. surface) ──
-            E_top, N_top = np.meshgrid(east_ax, north_ax, indexing="ij")
-            Z_top = np.full_like(E_top, neg_depth[0])
-            colors_top = cmap(norm(vol[:, :, 0]))
-            ax.plot_surface(
-                E_top, N_top, Z_top, facecolors=colors_top,
-                shade=False, alpha=0.9, rstride=1, cstride=1,
-            )
-
-            # ── Face 2: Front (north = max) ──
-            E_front, D_front = np.meshgrid(east_ax, neg_depth, indexing="ij")
-            N_front = np.full_like(E_front, north_ax[-1])
-            colors_front = cmap(norm(vol[:, -1, :]))
-            ax.plot_surface(
-                E_front, N_front, D_front, facecolors=colors_front,
-                shade=False, alpha=0.9, rstride=1, cstride=1,
-            )
-
-            # ── Face 3: Right side (east = max) ──
-            N_side, D_side = np.meshgrid(north_ax, neg_depth, indexing="ij")
-            E_side = np.full_like(N_side, east_ax[-1])
-            colors_side = cmap(norm(vol[-1, :, :]))
-            ax.plot_surface(
-                E_side, N_side, D_side, facecolors=colors_side,
-                shade=False, alpha=0.9, rstride=1, cstride=1,
-            )
-
-            # Labels and styling
-            ax.set_xlabel("Easting (m)", fontsize=10, labelpad=10)
-            ax.set_ylabel("Northing (m)", fontsize=10, labelpad=10)
-            ax.set_zlabel("Depth (m)", fontsize=10, labelpad=10)
-            ax.tick_params(labelsize=8)
-            ax.view_init(elev=25, azim=-60)
-
-            # Colorbar
-            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-            sm.set_array([])
-            cbar = fig.colorbar(
-                sm, ax=ax, orientation="horizontal",
-                shrink=0.6, pad=0.08, aspect=30,
-            )
-            cbar.set_label("Delay (s)", fontsize=10)
 
             phase_short = phase.split(":")[-1] if ":" in phase else phase
-            ax.set_title(
-                f"SSST Corrections — Phase: {phase_short}, "
-                f"Station: {nsl_str}",
-                fontsize=12, pad=15,
-            )
-
             safe_nsl = nsl_str.replace(".", "_")
             safe_phase = phase.replace(":", "_")
-            filename = output_dir / f"ssst_3d_{safe_nsl}_{safe_phase}.png"
-            fig.savefig(filename, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logger.info("saved SSST 3D plot: %s", filename)
+            title = (
+                f"Delay volume — Phase: {phase_short}, "
+                f"Station: {nsl_str}"
+            )
+
+            # Try plotly first for true volume rendering
+            try:
+                _plot_volume_plotly(
+                    east_ax, north_ax, depth_ax, vol,
+                    vmax, title, safe_nsl, safe_phase, output_dir,
+                )
+            except (ImportError, Exception) as e:
+                logger.info("plotly unavailable (%s), using matplotlib", e)
+                _plot_volume_matplotlib(
+                    east_ax, north_ax, depth_ax, vol,
+                    vmax, title, safe_nsl, safe_phase, output_dir,
+                )
 
         # 2D slice plots
         _plot_ssst_slices(
-            east_ax, north_ax, depth_ax, vol.shape,
+            east_ax, north_ax, depth_ax, (ne, nn, nd),
             nsl_delays, e_idx, n_idx, d_idx,
             phase, output_dir,
         )
+
+
+def _plot_volume_plotly(
+    east_ax: np.ndarray,
+    north_ax: np.ndarray,
+    depth_ax: np.ndarray,
+    vol: np.ndarray,
+    vmax: float,
+    title: str,
+    safe_nsl: str,
+    safe_phase: str,
+    output_dir: Path,
+) -> None:
+    """Plot delay volume using plotly's Volume trace."""
+    import plotly.graph_objects as go
+
+    ne, nn, nd = vol.shape
+
+    # Create meshgrid for plotly (needs flattened X, Y, Z, values)
+    E, N, D = np.meshgrid(east_ax, north_ax, -depth_ax, indexing="ij")
+
+    fig = go.Figure(data=go.Volume(
+        x=E.flatten(),
+        y=N.flatten(),
+        z=D.flatten(),
+        value=vol.flatten(),
+        isomin=-vmax,
+        isomax=vmax,
+        opacity=0.15,
+        surface_count=25,
+        colorscale="RdBu_r",
+        colorbar=dict(
+            title="Delay (s)",
+            orientation="h",
+            y=-0.1,
+            thickness=15,
+        ),
+        caps=dict(x_show=True, y_show=True, z_show=True),
+    ))
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=14)),
+        scene=dict(
+            xaxis_title="Easting (m)",
+            yaxis_title="Northing (m)",
+            zaxis_title="Depth (m)",
+            camera=dict(eye=dict(x=1.5, y=1.5, z=0.8)),
+        ),
+        width=1000,
+        height=800,
+        margin=dict(l=20, r=20, t=60, b=80),
+    )
+
+    # Save as interactive HTML
+    html_file = output_dir / f"ssst_3d_{safe_nsl}_{safe_phase}.html"
+    fig.write_html(str(html_file))
+    logger.info("saved SSST 3D volume (interactive): %s", html_file)
+
+    # Try to save as static PNG too
+    try:
+        png_file = output_dir / f"ssst_3d_{safe_nsl}_{safe_phase}.png"
+        fig.write_image(str(png_file), scale=2)
+        logger.info("saved SSST 3D volume (PNG): %s", png_file)
+    except (ImportError, ValueError) as e:
+        logger.info("static PNG export unavailable (%s), HTML saved", e)
+
+
+def _plot_volume_matplotlib(
+    east_ax: np.ndarray,
+    north_ax: np.ndarray,
+    depth_ax: np.ndarray,
+    vol: np.ndarray,
+    vmax: float,
+    title: str,
+    safe_nsl: str,
+    safe_phase: str,
+    output_dir: Path,
+) -> None:
+    """Fallback: plot delay volume as multi-slice surfaces in matplotlib."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    ne, nn, nd = vol.shape
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    cmap = plt.cm.RdBu_r
+    neg_depth = -depth_ax
+
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Plot multiple depth slices as semi-transparent surfaces
+    n_slices = min(nd, 8)
+    slice_indices = np.linspace(0, nd - 1, n_slices, dtype=int)
+
+    for di in slice_indices:
+        E, N = np.meshgrid(east_ax, north_ax, indexing="ij")
+        Z = np.full_like(E, neg_depth[di])
+        colors = cmap(norm(vol[:, :, di]))
+        ax.plot_surface(
+            E, N, Z, facecolors=colors,
+            shade=False, alpha=0.4, rstride=1, cstride=1,
+        )
+
+    # Plot front face (north = max)
+    E_f, D_f = np.meshgrid(east_ax, neg_depth, indexing="ij")
+    N_f = np.full_like(E_f, north_ax[-1])
+    ax.plot_surface(
+        E_f, N_f, D_f, facecolors=cmap(norm(vol[:, -1, :])),
+        shade=False, alpha=0.6, rstride=1, cstride=1,
+    )
+
+    # Plot right face (east = max)
+    N_s, D_s = np.meshgrid(north_ax, neg_depth, indexing="ij")
+    E_s = np.full_like(N_s, east_ax[-1])
+    ax.plot_surface(
+        E_s, N_s, D_s, facecolors=cmap(norm(vol[-1, :, :])),
+        shade=False, alpha=0.6, rstride=1, cstride=1,
+    )
+
+    ax.set_xlabel("Easting (m)", fontsize=10, labelpad=10)
+    ax.set_ylabel("Northing (m)", fontsize=10, labelpad=10)
+    ax.set_zlabel("Depth (m)", fontsize=10, labelpad=10)
+    ax.set_title(title, fontsize=12, pad=15)
+    ax.tick_params(labelsize=8)
+    ax.view_init(elev=25, azim=-60)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(
+        sm, ax=ax, orientation="horizontal",
+        shrink=0.6, pad=0.08, aspect=30,
+    )
+    cbar.set_label("Delay (s)", fontsize=10)
+
+    filename = output_dir / f"ssst_3d_{safe_nsl}_{safe_phase}.png"
+    fig.savefig(filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("saved SSST 3D plot: %s", filename)
 
 
 def _plot_ssst_slices(
