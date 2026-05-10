@@ -596,6 +596,10 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
 
     Computes spatially-varying station corrections on the octree grid.
     Uses GPU CUDA acceleration via PyTorch when available.
+
+    The delay grid is stored as a regular 3D array and interpolated using
+    scipy's RegularGridInterpolator for instant build and O(1) queries.
+    Results are cached to disk so that subsequent runs skip GPU computation.
     """
 
     corrections: Literal["SourceSpecificStationCorrections"] = (
@@ -643,19 +647,22 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
     )
 
     # Internal state
-    # _grid_delays[phase][nsl_str] -> np.ndarray of shape (n_grid_nodes,)
-    _grid_delays: dict[str, dict[str, np.ndarray]] = PrivateAttr(default_factory=dict)
-    # Grid node coordinates (n_grid_nodes, 3) for interpolation
-    _grid_coords: np.ndarray | None = PrivateAttr(default=None)
-    _grid_nodes: list[Node] = PrivateAttr(default_factory=list)
-    _interpolators: dict[str, dict[str, object]] = PrivateAttr(default_factory=dict)
+    _grid_axes: tuple[np.ndarray, ...] = PrivateAttr(default=())
+    _delay_grids: dict[str, dict[str, np.ndarray]] = PrivateAttr(
+        default_factory=dict
+    )
+    _interpolators: dict[str, dict[str, object]] = PrivateAttr(
+        default_factory=dict
+    )
 
     @property
     def n_stations(self) -> int:
-        if not self._grid_delays:
+        if not self._delay_grids:
             return 0
-        first_phase = next(iter(self._grid_delays))
-        return len(self._grid_delays[first_phase])
+        first_phase = next(iter(self._delay_grids))
+        return len(self._delay_grids[first_phase])
+
+    # ── GPU Computation ───────────────────────────────────────────────
 
     def _compute_ssst_grid_gpu(
         self,
@@ -664,7 +671,10 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         phases: list[str],
         station_nsls: list[str],
     ) -> dict[str, dict[str, np.ndarray]]:
-        """Compute SSST grid using GPU CUDA acceleration."""
+        """Compute SSST grid delays using GPU CUDA acceleration.
+
+        Returns flat delay arrays per (phase, station).
+        """
         n_grid = grid_coords.shape[0]
         device = DEVICE
         logger.info("computing SSST grid on %s (%d grid nodes)", device, n_grid)
@@ -676,9 +686,7 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         for rec in records:
             phase_nsl_records[rec.phase][rec.nsl.pretty].append(rec)
 
-        # Convert grid coords to tensor
         grid_tensor = torch.tensor(grid_coords, dtype=torch.float32, device=device)
-
         result: dict[str, dict[str, np.ndarray]] = {}
 
         for phase in phases:
@@ -692,165 +700,151 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
                     result[phase][nsl_str] = np.zeros(n_grid, dtype=np.float32)
                     continue
 
-                # Build event tensors on GPU
+                # Build tensors on GPU
                 event_coords = torch.tensor(
                     [[r.event_east, r.event_north, r.event_depth] for r in recs],
-                    dtype=torch.float32,
-                    device=device,
+                    dtype=torch.float32, device=device,
                 )
                 delays_t = torch.tensor(
-                    [r.delay for r in recs], dtype=torch.float32, device=device
+                    [r.delay for r in recs], dtype=torch.float32, device=device,
                 )
                 base_weights = torch.tensor(
                     [compute_weight(self.weighting, r.confidence, r.semblance)
                      for r in recs],
-                    dtype=torch.float32,
-                    device=device,
+                    dtype=torch.float32, device=device,
                 )
-
-                # Compute distances: (n_grid, n_events)
-                distances = torch.cdist(grid_tensor, event_coords)
-
-                # Spatial weights: 1 / distance^exponent (avoid div by zero)
-                eps = torch.tensor(1.0, device=device)
-                spatial_weights = 1.0 / torch.pow(
-                    torch.maximum(distances, eps), self.spatial_weighting_exponent
-                )
-
-                # Combined weights: (n_grid, n_events)
-                combined_weights = spatial_weights * base_weights.unsqueeze(0)
-
-                # For each grid node, compute weighted average delay
-                # Adaptive radius: expand until min_confidence is met
                 confidences = torch.tensor(
-                    [r.confidence for r in recs], dtype=torch.float32, device=device
+                    [r.confidence for r in recs], dtype=torch.float32, device=device,
                 )
+
+                # Distances and spatial weights: (n_grid, n_events)
+                distances = torch.cdist(grid_tensor, event_coords)
+                eps = torch.tensor(1.0, device=device)
+                spatial_w = 1.0 / torch.pow(
+                    torch.maximum(distances, eps), self.spatial_weighting_exponent,
+                )
+
+                # Combined weights and weighted average
+                combined_w = spatial_w * base_weights.unsqueeze(0)
+                w_sums = combined_w.sum(dim=1)
+                w_delays = (combined_w * delays_t.unsqueeze(0)).sum(dim=1)
+                cum_conf = (spatial_w * confidences.unsqueeze(0)).sum(dim=1)
 
                 node_delays = torch.zeros(n_grid, dtype=torch.float32, device=device)
 
-                # Batch computation: weighted average
-                weight_sums = combined_weights.sum(dim=1)
-                weighted_delays = (combined_weights * delays_t.unsqueeze(0)).sum(dim=1)
+                # Where confidence is sufficient → weighted average
+                valid = (w_sums > 0) & (cum_conf >= self.min_confidence)
+                node_delays[valid] = w_delays[valid] / w_sums[valid]
 
-                # Check min_confidence per node
-                cumulative_conf = (spatial_weights * confidences.unsqueeze(0)).sum(dim=1)
-
-                # Where confidence is sufficient, use weighted average
-                valid = (weight_sums > 0) & (cumulative_conf >= self.min_confidence)
-                node_delays[valid] = weighted_delays[valid] / weight_sums[valid]
-
-                # For nodes with insufficient confidence, use increasing radius
-                insufficient = ~valid & (weight_sums > 0)
+                # Fallback for insufficient confidence → global weighted average
+                insufficient = ~valid & (w_sums > 0)
                 if insufficient.any():
-                    # Fallback: use all events with uniform spatial weight
                     total_w = base_weights.sum()
                     if total_w > 0:
-                        global_delay = (delays_t * base_weights).sum() / total_w
-                        node_delays[insufficient] = global_delay
+                        node_delays[insufficient] = (
+                            (delays_t * base_weights).sum() / total_w
+                        )
 
                 result[phase][nsl_str] = node_delays.cpu().numpy()
 
         return result
 
-    def _build_interpolators(
+    # ── Regular Grid Interpolator ─────────────────────────────────────
+
+    def _flat_to_3d(
         self,
         grid_coords: np.ndarray,
-        grid_delays: dict[str, dict[str, np.ndarray]],
-    ) -> dict[str, dict[str, object]]:
-        """Build scipy interpolators for delay lookup."""
-        from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+        flat_delays: dict[str, dict[str, np.ndarray]],
+    ) -> tuple[
+        tuple[np.ndarray, ...],
+        dict[str, dict[str, np.ndarray]],
+    ]:
+        """Convert flat delay arrays to 3D regular grid arrays.
 
-        interpolators: dict[str, dict[str, object]] = {}
-        method = self.delay_interpolation_method
+        Returns (grid_axes, delay_grids_3d).
+        """
+        east_ax = np.unique(grid_coords[:, 0])
+        north_ax = np.unique(grid_coords[:, 1])
+        depth_ax = np.unique(grid_coords[:, 2])
 
-        for phase, nsl_delays in grid_delays.items():
-            interpolators[phase] = {}
-            for nsl_str, delays in nsl_delays.items():
-                if method == "nearest":
-                    interp = NearestNDInterpolator(grid_coords, delays)
-                elif method == "linear":
-                    try:
-                        interp = LinearNDInterpolator(grid_coords, delays)
-                    except Exception:
-                        logger.warning(
-                            "linear interpolation failed for %s/%s, "
-                            "falling back to nearest",
-                            phase, nsl_str,
-                        )
-                        interp = NearestNDInterpolator(grid_coords, delays)
-                elif method == "cubic":
-                    try:
-                        from scipy.interpolate import CloughTocher2DInterpolator
-                        # Cubic only works in 2D, fall back to linear for 3D
-                        interp = LinearNDInterpolator(grid_coords, delays)
-                    except Exception:
-                        interp = NearestNDInterpolator(grid_coords, delays)
-                else:
-                    interp = NearestNDInterpolator(grid_coords, delays)
-                interpolators[phase][nsl_str] = interp
-
-        return interpolators
-
-    def get_delay(
-        self,
-        station_nsl: NSL,
-        phase: PhaseDescription,
-        node: Node | None = None,
-    ) -> float:
-        if node is None or not self._interpolators:
-            return 0.0
-
-        nsl_str = station_nsl.pretty
-        if phase not in self._interpolators:
-            return 0.0
-        if nsl_str not in self._interpolators[phase]:
-            return 0.0
-
-        interp = self._interpolators[phase][nsl_str]
-        coords = np.array([[node.east, node.north, node.depth]])
-        result = interp(coords)
-        val = float(result[0])
-        return val if np.isfinite(val) else 0.0
-
-    async def get_delays(
-        self,
-        station_nsls: Sequence[NSL],
-        phase: PhaseDescription,
-        nodes: Sequence[Node],
-    ) -> np.ndarray:
-        if not self._interpolators or phase not in self._interpolators:
-            return np.zeros(
-                (len(nodes), len(station_nsls)), dtype=np.float32
-            )
-
-        # Build node coordinates
-        node_coords = np.array(
-            [(n.east, n.north, n.depth) for n in nodes], dtype=np.float32
+        ne, nn, nd = len(east_ax), len(north_ax), len(depth_ax)
+        logger.info(
+            "regular grid: %d × %d × %d = %d nodes",
+            ne, nn, nd, ne * nn * nd,
         )
 
-        n_nodes = len(nodes)
-        n_stations = len(station_nsls)
-        delays = np.zeros((n_nodes, n_stations), dtype=np.float32)
+        # Build index lookup: (east, north, depth) → flat index
+        e_idx = np.searchsorted(east_ax, grid_coords[:, 0])
+        n_idx = np.searchsorted(north_ax, grid_coords[:, 1])
+        d_idx = np.searchsorted(depth_ax, grid_coords[:, 2])
 
-        phase_interps = self._interpolators.get(phase, {})
-        for sta_idx, nsl in enumerate(station_nsls):
-            nsl_str = nsl.pretty
-            interp = phase_interps.get(nsl_str)
-            if interp is None:
-                continue
-            result = await asyncio.to_thread(interp, node_coords)
-            col = np.asarray(result, dtype=np.float32)
-            col[~np.isfinite(col)] = 0.0
-            delays[:, sta_idx] = col
+        grids_3d: dict[str, dict[str, np.ndarray]] = {}
+        for phase, nsl_delays in flat_delays.items():
+            grids_3d[phase] = {}
+            for nsl_str, delays_1d in nsl_delays.items():
+                arr = np.zeros((ne, nn, nd), dtype=np.float32)
+                arr[e_idx, n_idx, d_idx] = delays_1d
+                grids_3d[phase][nsl_str] = arr
 
-        return delays
+        return (east_ax, north_ax, depth_ax), grids_3d
+
+    def _build_interpolators(
+        self,
+        grid_axes: tuple[np.ndarray, ...],
+        delay_grids: dict[str, dict[str, np.ndarray]],
+    ) -> dict[str, dict[str, object]]:
+        """Build RegularGridInterpolator for each (phase, station).
+
+        This is instant — no Delaunay triangulation needed.
+        """
+        from scipy.interpolate import RegularGridInterpolator
+
+        method = self.delay_interpolation_method
+
+        # Validate and select interpolation method
+        if method == "nearest":
+            scipy_method = "nearest"
+        elif method == "linear":
+            scipy_method = "linear"
+        elif method == "cubic":
+            # cubic requires scipy >= 1.10
+            try:
+                RegularGridInterpolator(
+                    (np.array([0, 1]), np.array([0, 1]), np.array([0, 1])),
+                    np.zeros((2, 2, 2)),
+                    method="cubic",
+                )
+                scipy_method = "cubic"
+            except ValueError:
+                logger.warning("cubic interpolation not supported, using linear")
+                scipy_method = "linear"
+        else:
+            logger.warning("unknown method '%s', falling back to linear", method)
+            scipy_method = "linear"
+
+        interpolators: dict[str, dict[str, object]] = {}
+        for phase, nsl_delays in delay_grids.items():
+            interpolators[phase] = {}
+            for nsl_str, delays_3d in nsl_delays.items():
+                interp = RegularGridInterpolator(
+                    grid_axes,
+                    delays_3d,
+                    method=scipy_method,
+                    bounds_error=False,
+                    fill_value=0.0,
+                )
+                interpolators[phase][nsl_str] = interp
+
+        n_total = sum(len(v) for v in interpolators.values())
+        logger.info(
+            "built %d interpolators (method=%s) — instant", n_total, scipy_method,
+        )
+        return interpolators
+
+    # ── Cache Management ──────────────────────────────────────────────
 
     def _compute_cache_key(self) -> str:
-        """Compute a hash key based on config parameters and import rundirs.
-
-        The cache is invalidated when any config parameter or the source
-        data (detected by rundir modification times and file sizes) changes.
-        """
+        """Compute a hash key for cache invalidation."""
         key_parts = [
             str(sorted(str(p) for p in self.import_rundirs)),
             self.weighting,
@@ -862,113 +856,157 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
             self.delay_interpolation_method,
         ]
 
-        # Include file modification times from import rundirs for invalidation
         for rd in sorted(self.import_rundirs, key=str):
             rd_path = Path(rd).resolve()
-            detections_file = rd_path / "detections.json"
-            receivers_file = rd_path / "detections_receivers.json"
-            for f in (detections_file, receivers_file):
+            for fname in ("detections.json", "detections_receivers.json"):
+                f = rd_path / fname
                 if f.exists():
                     stat = f.stat()
                     key_parts.append(f"{f}:{stat.st_mtime}:{stat.st_size}")
 
-        key_str = "|".join(key_parts)
-        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+        return hashlib.sha256("|".join(key_parts).encode()).hexdigest()[:16]
 
-    def _load_from_cache(
+    def _save_cache(
         self,
-        corrections_dir: Path,
-        phases: list[str],
-        station_nsls: list[str],
-    ) -> bool:
-        """Try to load SSST grid delays from cached .npy files.
-
-        Returns True if cache was loaded successfully, False otherwise.
-        """
-        cache_file = corrections_dir / "cache_key.txt"
-        if not cache_file.exists():
-            return False
-
-        # Check cache key matches
-        cached_key = cache_file.read_text().strip()
-        current_key = self._compute_cache_key()
-        if cached_key != current_key:
-            logger.info(
-                "SSST cache key mismatch (cached=%s, current=%s), recomputing",
-                cached_key, current_key,
-            )
-            return False
-
-        # Load grid coordinates
-        coords_file = corrections_dir / "grid_coords.npy"
-        if not coords_file.exists():
-            return False
-        self._grid_coords = np.load(coords_file)
-
-        # Load grid delays from .npy files
-        self._grid_delays = {}
-        for phase in phases:
-            phase_dir = corrections_dir / phase.replace(":", "_")
-            if not phase_dir.is_dir():
-                continue
-            self._grid_delays[phase] = {}
-            for nsl_str in station_nsls:
-                npy_file = phase_dir / f"{nsl_str.replace('.', '_')}.npy"
-                if npy_file.exists():
-                    self._grid_delays[phase][nsl_str] = np.load(npy_file)
-                else:
-                    self._grid_delays[phase][nsl_str] = np.zeros(
-                        self._grid_coords.shape[0], dtype=np.float32
-                    )
-
-        if not self._grid_delays:
-            return False
-
-        logger.info(
-            "loaded SSST corrections from cache (%d phases, %d grid nodes)",
-            len(self._grid_delays),
-            self._grid_coords.shape[0],
-        )
-        return True
-
-    def _save_to_cache(
-        self,
-        corrections_dir: Path,
+        cache_dir: Path,
         phases: list[str],
         station_nsls: list[str],
     ) -> None:
-        """Save SSST grid delays to cache files."""
-        corrections_dir.mkdir(exist_ok=True)
+        """Save SSST grid and axes to cache files."""
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save cache key
         cache_key = self._compute_cache_key()
-        (corrections_dir / "cache_key.txt").write_text(cache_key)
+        (cache_dir / "cache_key.txt").write_text(cache_key)
 
-        # Save grid coordinates
-        np.save(corrections_dir / "grid_coords.npy", self._grid_coords)
+        # Save grid axes
+        np.savez(
+            cache_dir / "grid_axes.npz",
+            east=self._grid_axes[0],
+            north=self._grid_axes[1],
+            depth=self._grid_axes[2],
+        )
+
+        # Save 3D delay grids
+        for phase, nsl_delays in self._delay_grids.items():
+            phase_dir = cache_dir / phase.replace(":", "_")
+            phase_dir.mkdir(exist_ok=True)
+            for nsl_str, delays_3d in nsl_delays.items():
+                np.save(
+                    phase_dir / f"{nsl_str.replace('.', '_')}.npy",
+                    delays_3d,
+                )
 
         # Save metadata
         meta = {
             "cache_key": cache_key,
-            "n_grid_nodes": len(self._grid_nodes),
+            "grid_shape": [len(a) for a in self._grid_axes],
+            "n_grid_nodes": int(np.prod([len(a) for a in self._grid_axes])),
             "octree_level": self.resolution_octree_level,
+            "interpolation_method": self.delay_interpolation_method,
             "phases": phases,
             "stations": station_nsls,
             "device": str(DEVICE),
         }
-        (corrections_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        (cache_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        logger.info("saved SSST cache (key=%s) to %s", cache_key, cache_dir)
 
-        # Save grid delays as numpy arrays
-        for phase, nsl_delays in self._grid_delays.items():
-            phase_dir = corrections_dir / phase.replace(":", "_")
-            phase_dir.mkdir(exist_ok=True)
-            for nsl_str, delays in nsl_delays.items():
-                np.save(
-                    phase_dir / f"{nsl_str.replace('.', '_')}.npy",
-                    delays,
-                )
+    def _load_cache(
+        self,
+        cache_dir: Path,
+        phases: list[str],
+        station_nsls: list[str],
+    ) -> bool:
+        """Try to load SSST from cached files. Returns True on success."""
+        cache_file = cache_dir / "cache_key.txt"
+        if not cache_file.exists():
+            return False
 
-        logger.info("saved SSST cache (key=%s) to %s", cache_key, corrections_dir)
+        cached_key = cache_file.read_text().strip()
+        current_key = self._compute_cache_key()
+        if cached_key != current_key:
+            logger.info("SSST cache outdated (key mismatch), will recompute")
+            return False
+
+        axes_file = cache_dir / "grid_axes.npz"
+        if not axes_file.exists():
+            return False
+
+        # Load grid axes
+        axes_data = np.load(axes_file)
+        self._grid_axes = (axes_data["east"], axes_data["north"], axes_data["depth"])
+
+        # Load 3D delay grids
+        self._delay_grids = {}
+        for phase in phases:
+            phase_dir = cache_dir / phase.replace(":", "_")
+            if not phase_dir.is_dir():
+                continue
+            self._delay_grids[phase] = {}
+            for nsl_str in station_nsls:
+                npy_file = phase_dir / f"{nsl_str.replace('.', '_')}.npy"
+                if npy_file.exists():
+                    self._delay_grids[phase][nsl_str] = np.load(npy_file)
+
+        if not self._delay_grids:
+            return False
+
+        n_nodes = int(np.prod([len(a) for a in self._grid_axes]))
+        logger.info("loaded SSST cache: %d nodes, %d phases", n_nodes, len(phases))
+        return True
+
+    # ── Delay Lookup ──────────────────────────────────────────────────
+
+    def get_delay(
+        self,
+        station_nsl: NSL,
+        phase: PhaseDescription,
+        node: Node | None = None,
+    ) -> float:
+        if node is None or not self._interpolators:
+            return 0.0
+
+        nsl_str = station_nsl.pretty
+        phase_interps = self._interpolators.get(phase)
+        if not phase_interps:
+            return 0.0
+        interp = phase_interps.get(nsl_str)
+        if not interp:
+            return 0.0
+
+        val = float(interp([[node.east, node.north, node.depth]])[0])
+        return val if np.isfinite(val) else 0.0
+
+    async def get_delays(
+        self,
+        station_nsls: Sequence[NSL],
+        phase: PhaseDescription,
+        nodes: Sequence[Node],
+    ) -> np.ndarray:
+        n_nodes = len(nodes)
+        n_stations = len(station_nsls)
+
+        if not self._interpolators or phase not in self._interpolators:
+            return np.zeros((n_nodes, n_stations), dtype=np.float32)
+
+        node_coords = np.array(
+            [(n.east, n.north, n.depth) for n in nodes], dtype=np.float32,
+        )
+
+        delays = np.zeros((n_nodes, n_stations), dtype=np.float32)
+        phase_interps = self._interpolators[phase]
+
+        for idx, nsl in enumerate(station_nsls):
+            interp = phase_interps.get(nsl.pretty)
+            if interp is None:
+                continue
+            col = interp(node_coords)
+            col = np.asarray(col, dtype=np.float32)
+            col[~np.isfinite(col)] = 0.0
+            delays[:, idx] = col
+
+        return delays
+
+    # ── Prepare ───────────────────────────────────────────────────────
 
     async def prepare(
         self,
@@ -980,35 +1018,20 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         logger.info("preparing SourceSpecificStationCorrections (SSST)")
         phases_list = list(phases)
         station_nsls = [sta.nsl.pretty for sta in stations]
+        cache_dir = rundir / "ssst_corrections"
 
-        corrections_dir = rundir / "ssst_corrections"
-
-        # === Try loading from cache first ===
-        if corrections_dir.exists():
-            cache_loaded = self._load_from_cache(
-                corrections_dir, phases_list, station_nsls,
+        # ── Try cache ──
+        if cache_dir.exists() and self._load_cache(
+            cache_dir, phases_list, station_nsls,
+        ):
+            self._interpolators = self._build_interpolators(
+                self._grid_axes, self._delay_grids,
             )
-            if cache_loaded:
-                # Build octree grid nodes for coordinate reference
-                ssst_octree = octree.model_copy(deep=True)
-                ssst_octree.model_post_init(None)
-                ssst_octree.set_level(self.resolution_octree_level)
-                self._grid_nodes = list(ssst_octree)
+            logger.info("SSST ready from cache — GPU computation skipped")
+            return
 
-                # Build interpolators from cached data
-                self._interpolators = await asyncio.to_thread(
-                    self._build_interpolators,
-                    self._grid_coords,
-                    self._grid_delays,
-                )
-                logger.info(
-                    "SSST corrections loaded from cache — "
-                    "skipped GPU computation"
-                )
-                return
-
-        # === No valid cache, compute from scratch ===
-        logger.info("no valid SSST cache found, computing from scratch")
+        # ── Compute from scratch ──
+        logger.info("computing SSST from scratch (no valid cache)")
 
         # Collect delay records
         all_records: list[DelayRecord] = []
@@ -1033,42 +1056,44 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         ssst_octree = octree.model_copy(deep=True)
         ssst_octree.model_post_init(None)
         ssst_octree.set_level(self.resolution_octree_level)
-        self._grid_nodes = list(ssst_octree)
 
-        # Get grid coordinates
-        self._grid_coords = np.array(
-            [(n.east, n.north, n.depth) for n in self._grid_nodes],
+        grid_coords = np.array(
+            [(n.east, n.north, n.depth) for n in ssst_octree],
             dtype=np.float32,
         )
         logger.info(
             "SSST grid: %d nodes at octree level %d",
-            len(self._grid_nodes),
+            grid_coords.shape[0],
             self.resolution_octree_level,
         )
 
-        # Compute SSST grid using GPU
-        self._grid_delays = await asyncio.to_thread(
+        # GPU computation
+        flat_delays = await asyncio.to_thread(
             self._compute_ssst_grid_gpu,
             all_records,
-            self._grid_coords,
+            grid_coords,
             phases_list,
             station_nsls,
         )
 
-        # Build interpolators
-        self._interpolators = await asyncio.to_thread(
-            self._build_interpolators,
-            self._grid_coords,
-            self._grid_delays,
+        # Convert flat arrays → 3D regular grid
+        self._grid_axes, self._delay_grids = self._flat_to_3d(
+            grid_coords, flat_delays,
         )
 
-        # Save to cache
-        self._save_to_cache(corrections_dir, phases_list, station_nsls)
+        # Build interpolators (instant with RegularGridInterpolator)
+        self._interpolators = self._build_interpolators(
+            self._grid_axes, self._delay_grids,
+        )
 
-        # Plot SSST 3D volume
+        # Save cache
+        self._save_cache(cache_dir, phases_list, station_nsls)
+
+        # Plot
         await asyncio.to_thread(
             _plot_ssst_3d_volume,
-            self._grid_coords,
-            self._grid_delays,
-            corrections_dir,
+            grid_coords,
+            flat_delays,
+            cache_dir,
         )
+
