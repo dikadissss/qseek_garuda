@@ -10,6 +10,7 @@ from qseek.corrections.base import TravelTimeCorrections
 
 # Has to be imported to register as subclass
 from qseek.corrections.simple import SimpleCorrections  # noqa: F401
+from qseek.dev.station_corrections import StationCorrections, SourceSpecificStationCorrections  # noqa: F401, E501
 
 logger = logging.getLogger(__name__)
 
