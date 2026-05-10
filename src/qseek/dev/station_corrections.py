@@ -435,6 +435,14 @@ def _plot_volume_matplotlib(
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
 
+    try:
+        from scipy.ndimage import gaussian_filter
+        vol = gaussian_filter(vol.astype(np.float64), sigma=1.5).astype(
+            np.float32
+        )
+    except ImportError:
+        pass
+
     ne, nn, nd = vol.shape
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
     cmap = plt.cm.RdBu_r
@@ -443,33 +451,31 @@ def _plot_volume_matplotlib(
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Plot multiple depth slices as semi-transparent surfaces
-    n_slices = min(nd, 8)
-    slice_indices = np.linspace(0, nd - 1, n_slices, dtype=int)
+    # ── Top face (depth = shallowest) ──
+    E_top, N_top = np.meshgrid(east_ax, north_ax, indexing="ij")
+    Z_top = np.full_like(E_top, neg_depth[0])
+    ax.plot_surface(
+        E_top, N_top, Z_top, facecolors=cmap(norm(vol[:, :, 0])),
+        shade=False, alpha=0.85, rstride=1, cstride=1,
+        linewidth=0, edgecolor="none", antialiased=True,
+    )
 
-    for di in slice_indices:
-        E, N = np.meshgrid(east_ax, north_ax, indexing="ij")
-        Z = np.full_like(E, neg_depth[di])
-        colors = cmap(norm(vol[:, :, di]))
-        ax.plot_surface(
-            E, N, Z, facecolors=colors,
-            shade=False, alpha=0.4, rstride=1, cstride=1,
-        )
-
-    # Plot front face (north = max)
+    # ── Front face (north = max) ──
     E_f, D_f = np.meshgrid(east_ax, neg_depth, indexing="ij")
     N_f = np.full_like(E_f, north_ax[-1])
     ax.plot_surface(
         E_f, N_f, D_f, facecolors=cmap(norm(vol[:, -1, :])),
-        shade=False, alpha=0.6, rstride=1, cstride=1,
+        shade=False, alpha=0.85, rstride=1, cstride=1,
+        linewidth=0, edgecolor="none", antialiased=True,
     )
 
-    # Plot right face (east = max)
+    # ── Right face (east = max) ──
     N_s, D_s = np.meshgrid(north_ax, neg_depth, indexing="ij")
     E_s = np.full_like(N_s, east_ax[-1])
     ax.plot_surface(
         E_s, N_s, D_s, facecolors=cmap(norm(vol[-1, :, :])),
-        shade=False, alpha=0.6, rstride=1, cstride=1,
+        shade=False, alpha=0.85, rstride=1, cstride=1,
+        linewidth=0, edgecolor="none", antialiased=True,
     )
 
     ax.set_xlabel("Easting (m)", fontsize=10, labelpad=10)
@@ -951,21 +957,22 @@ class SourceSpecificStationCorrections(TravelTimeCorrections):
         method = self.delay_interpolation_method
 
         # Validate and select interpolation method
+        # cubic requires at least 4 points per axis dimension
+        min_axis_len = min(len(ax) for ax in grid_axes)
+
         if method == "nearest":
             scipy_method = "nearest"
         elif method == "linear":
             scipy_method = "linear"
         elif method == "cubic":
-            # cubic requires scipy >= 1.10
-            try:
-                RegularGridInterpolator(
-                    (np.array([0, 1]), np.array([0, 1]), np.array([0, 1])),
-                    np.zeros((2, 2, 2)),
-                    method="cubic",
-                )
+            if min_axis_len >= 4:
                 scipy_method = "cubic"
-            except ValueError:
-                logger.warning("cubic interpolation not supported, using linear")
+            else:
+                logger.info(
+                    "cubic requires >= 4 points per axis (have %d), "
+                    "using linear instead",
+                    min_axis_len,
+                )
                 scipy_method = "linear"
         else:
             logger.warning("unknown method '%s', falling back to linear", method)
